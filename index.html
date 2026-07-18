@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PaiOS</title>
+<style>
+  :root{
+    --bg: #0b0f0a;
+    --bg-vignette: #060806;
+    --amber: #ffb000;
+    --amber-dim: #a86e00;
+    --amber-bright: #ffd166;
+    --green: #5ff29a;
+    --red: #ff5f5f;
+    --ghost: rgba(255,176,0,0.08);
+    --mono: "IBM Plex Mono", "JetBrains Mono", "Courier New", monospace;
+  }
+  *{ box-sizing: border-box; }
+  html,body{
+    margin:0; padding:0; height:100%;
+    background: radial-gradient(ellipse at center, var(--bg) 0%, var(--bg-vignette) 100%);
+    font-family: var(--mono);
+    overflow:hidden;
+  }
+  #crt{
+    position:relative;
+    width:100%; height:100vh;
+    padding: 28px 34px;
+    color: var(--amber);
+    display:flex; flex-direction:column;
+  }
+  /* scanlines + flicker */
+  #crt::before{
+    content:"";
+    position:absolute; inset:0;
+    background: repeating-linear-gradient(
+      to bottom,
+      rgba(255,176,0,0.035) 0px,
+      rgba(255,176,0,0.035) 1px,
+      transparent 2px,
+      transparent 3px
+    );
+    pointer-events:none;
+    mix-blend-mode: overlay;
+    z-index: 5;
+  }
+  #crt::after{
+    content:"";
+    position:absolute; inset:0;
+    box-shadow: inset 0 0 140px 40px rgba(0,0,0,0.85);
+    pointer-events:none;
+    z-index: 6;
+  }
+  @keyframes flicker{
+    0%,100%{ opacity:1; }
+    92%{ opacity:1; }
+    93%{ opacity:0.94; }
+    94%{ opacity:1; }
+    96%{ opacity:0.97; }
+  }
+  #screen{ animation: flicker 6s infinite; flex:1; display:flex; flex-direction:column; min-height:0; }
+
+  .titlebar{
+    display:flex; justify-content:space-between; align-items:baseline;
+    border-bottom: 1px solid var(--amber-dim);
+    padding-bottom:10px; margin-bottom:14px;
+    font-size:12px; letter-spacing:2px; color: var(--amber-dim);
+    text-transform:uppercase;
+  }
+  .titlebar .brand{ color: var(--amber-bright); font-weight:600; letter-spacing:3px; }
+
+  #output{
+    flex:1; overflow-y:auto; white-space:pre-wrap; word-break:break-word;
+    font-size:14px; line-height:1.55; padding-right:6px;
+  }
+  #output::-webkit-scrollbar{ width:8px; }
+  #output::-webkit-scrollbar-thumb{ background: var(--amber-dim); }
+  #output::-webkit-scrollbar-track{ background: transparent; }
+
+  .line{ margin:0 0 2px 0; }
+  .dim{ color: var(--amber-dim); }
+  .bright{ color: var(--amber-bright); }
+  .green{ color: var(--green); }
+  .red{ color: var(--red); }
+  .prompt-echo{ color: var(--amber-bright); }
+  .prompt-echo .path{ color: var(--green); }
+
+  #inputline{
+    display:flex; align-items:center; gap:8px; padding-top:10px;
+    border-top: 1px solid var(--amber-dim);
+    font-size:14px;
+  }
+  #inputline .path{ color: var(--green); white-space:nowrap; }
+  #inputline .chev{ color: var(--amber-bright); }
+  #cmdInput{
+    flex:1; background:transparent; border:none; outline:none;
+    color: var(--amber-bright); font-family: var(--mono); font-size:14px;
+    caret-color: var(--amber-bright);
+  }
+  #cmdInput::placeholder{ color: var(--amber-dim); }
+
+  .ascii{ color: var(--amber-bright); font-size:12px; line-height:1.15; }
+
+  #boot{
+    position:absolute; inset:0; background:#04060380; z-index:10;
+  }
+
+  ::selection{ background: var(--amber-dim); color:#000; }
+
+  @media (max-width:600px){
+    #crt{ padding:16px; }
+    #output, #inputline{ font-size:12.5px; }
+  }
+</style>
+</head>
+<body>
+<div id="crt">
+  <div id="screen">
+    <div class="titlebar">
+      <span class="brand">PaiOS</span>
+      <span>build 1.0 — session term0</span>
+    </div>
+    <div id="output"></div>
+    <div id="inputline">
+      <span class="path"><span id="promptPath">~</span></span>
+      <span class="chev">&gt;</span>
+      <input id="cmdInput" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="type 'help'" />
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  const out = document.getElementById('output');
+  const input = document.getElementById('cmdInput');
+  const promptPath = document.getElementById('promptPath');
+
+  /* ---------- virtual filesystem ---------- */
+  // node: {type:'dir', children:{}} or {type:'file', content:''}
+  const fs = {
+    type:'dir',
+    children:{
+      home:{ type:'dir', children:{
+        guest:{ type:'dir', children:{
+          'readme.txt':{ type:'file', content:
+            "Welcome to PaiOS.\n\nThis is a single-page, browser-based terminal OS simulation.\nEverything you see runs client-side in memory — nothing is sent anywhere.\n\nTry: help, ls, cat readme.txt, neofetch, tree" },
+          notes:{ type:'dir', children:{
+            'todo.txt':{ type:'file', content:"1. learn PaiOS commands\n2. build something cool\n3. ???\n4. profit" }
+          }}
+        }}
+      }},
+      etc:{ type:'dir', children:{
+        'motd':{ type:'file', content:"PaiOS — a tiny terminal, entirely in your browser." }
+      }},
+      bin:{ type:'dir', children:{} }
+    }
+  };
+
+  let cwd = ['home','guest'];       // current path as array
+  let history = [];
+  let histIndex = -1;
+  let bootDone = false;
+
+  function resolvePath(parts){
+    let node = fs;
+    for(const p of parts){
+      if(node.type!=='dir' || !node.children[p]) return null;
+      node = node.children[p];
+    }
+    return node;
+  }
+  function dirAt(parts){
+    const n = resolvePath(parts);
+    return (n && n.type==='dir') ? n : null;
+  }
+  function pathStr(parts){ return '/' + parts.join('/'); }
+  function shortPath(parts){
+    const s = pathStr(parts);
+    return s.replace(/^\/home\/guest/, '~');
+  }
+
+  function print(html, cls){
+    const div = document.createElement('div');
+    div.className = 'line' + (cls ? ' '+cls : '');
+    div.innerHTML = html;
+    out.appendChild(div);
+    out.scrollTop = out.scrollHeight;
+  }
+  function printText(text, cls){
+    text.split('\n').forEach(l=> print(escapeHtml(l) || '&nbsp;', cls));
+  }
+  function escapeHtml(s){
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  /* ---------- commands ---------- */
+  const commands = {
+    help(){
+      printText(
+`Available commands:
+
+  help                 show this list
+  ls [path]            list directory contents
+  cd [path]            change directory
+  pwd                  print working directory
+  cat <file>           print file contents
+  echo <text>          print text
+  echo <text> > file    write text to a file (overwrite)
+  echo <text> >> file   append text to a file
+  mkdir <name>         create a directory
+  touch <name>         create an empty file
+  rm <name>            remove a file or empty directory
+  tree                 show filesystem tree from cwd
+  whoami               show current user
+  neofetch             show system info banner
+  date                 show current date/time
+  clear                clear the screen
+  history              show command history
+  reboot               replay the boot sequence`, 'dim');
+    },
+    ls(args){
+      const target = args[0] ? navigate(args[0]) : cwd;
+      if(target===null){ print(`ls: cannot access '${args[0]}': no such directory`, 'red'); return; }
+      const node = dirAt(target);
+      if(!node){ print(`ls: cannot access '${args[0]}': not a directory`, 'red'); return; }
+      const names = Object.keys(node.children);
+      if(names.length===0){ print('(empty)', 'dim'); return; }
+      print(names.map(n=>{
+        const child = node.children[n];
+        return child.type==='dir' ? `<span class="green">${n}/</span>` : n;
+      }).join('  '));
+    },
+    cd(args){
+      if(!args[0] || args[0]==='~'){ cwd=['home','guest']; updatePrompt(); return; }
+      const target = navigate(args[0]);
+      if(target===null || !dirAt(target)){ print(`cd: no such directory: ${args[0]}`, 'red'); return; }
+      cwd = target;
+      updatePrompt();
+    },
+    pwd(){ print(pathStr(cwd)); },
+    cat(args){
+      if(!args[0]){ print('cat: missing file operand', 'red'); return; }
+      const target = navigate(args[0]);
+      const node = target && resolvePath(target);
+      if(!node){ print(`cat: ${args[0]}: no such file`, 'red'); return; }
+      if(node.type!=='file'){ print(`cat: ${args[0]}: is a directory`, 'red'); return; }
+      printText(node.content || '');
+    },
+    echo(args, raw){
+      // support > and >> redirection
+      const m = raw.match(/^(.*?)(>>|>)\s*(\S+)\s*$/);
+      if(m){
+        const text = stripQuotes(m[1].trim());
+        const append = m[2]==='>>';
+        const target = navigate(m[3]);
+        if(!target){ print(`echo: bad path: ${m[3]}`, 'red'); return; }
+        const parentPath = target.slice(0,-1), name = target[target.length-1];
+        const parent = dirAt(parentPath);
+        if(!parent){ print(`echo: no such directory`, 'red'); return; }
+        const existing = parent.children[name];
+        if(existing && existing.type==='dir'){ print(`echo: ${m[3]} is a directory`, 'red'); return; }
+        const content = (append && existing) ? existing.content + '\n' + text : text;
+        parent.children[name] = { type:'file', content };
+        return;
+      }
+      print(escapeHtml(stripQuotes(raw)));
+    },
+    mkdir(args){
+      if(!args[0]){ print('mkdir: missing operand', 'red'); return; }
+      const target = navigate(args[0]);
+      if(!target){ print(`mkdir: bad path`, 'red'); return; }
+      const parent = dirAt(target.slice(0,-1)), name = target[target.length-1];
+      if(!parent){ print(`mkdir: no such directory`, 'red'); return; }
+      if(parent.children[name]){ print(`mkdir: '${args[0]}' already exists`, 'red'); return; }
+      parent.children[name] = { type:'dir', children:{} };
+    },
+    touch(args){
+      if(!args[0]){ print('touch: missing operand', 'red'); return; }
+      const target = navigate(args[0]);
+      if(!target){ print(`touch: bad path`, 'red'); return; }
+      const parent = dirAt(target.slice(0,-1)), name = target[target.length-1];
+      if(!parent){ print(`touch: no such directory`, 'red'); return; }
+      if(!parent.children[name]) parent.children[name] = { type:'file', content:'' };
+    },
+    rm(args){
+      if(!args[0]){ print('rm: missing operand', 'red'); return; }
+      const target = navigate(args[0]);
+      if(!target){ print(`rm: bad path`, 'red'); return; }
+      const parent = dirAt(target.slice(0,-1)), name = target[target.length-1];
+      if(!parent || !parent.children[name]){ print(`rm: no such file or directory: ${args[0]}`, 'red'); return; }
+      const node = parent.children[name];
+      if(node.type==='dir' && Object.keys(node.children).length>0){
+        print(`rm: '${args[0]}' is not empty`, 'red'); return;
+      }
+      delete parent.children[name];
+    },
+    tree(){
+      print(shortPath(cwd));
+      renderTree(dirAt(cwd), '');
+    },
+    whoami(){ print('guest'); },
+    date(){ print(new Date().toString()); },
+    clear(){ out.innerHTML=''; },
+    history(){
+      if(history.length===0){ print('(no history yet)', 'dim'); return; }
+      history.forEach((h,i)=> print(`${String(i+1).padStart(3,' ')}  ${h}`, 'dim'));
+    },
+    neofetch(){
+      const info = [
+        ['user','guest@paios'],
+        ['os','PaiOS 1.0 (browser)'],
+        ['kernel','js-vm 0.simulated'],
+        ['shell','paish'],
+        ['uptime', uptimeStr()],
+        ['files', String(countFiles(fs))],
+      ];
+      const logoLines = [
+        "  ____        _  ___  ____ ",
+        " |  _ \\ __ _ (_)/ _ \\/ ___|",
+        " | |_) / _` || | | | \\___ \\",
+        " |  __/ (_| || | |_| |___) |",
+        " |_|   \\__,_|/ |\\___/|____/ ",
+        "           |__/             "
+      ];
+      const maxLogo = Math.max(...logoLines.map(l=>l.length));
+      const rows = Math.max(logoLines.length, info.length);
+      for(let i=0;i<rows;i++){
+        const logoPart = (logoLines[i]||'').padEnd(maxLogo+3,' ');
+        const infoPart = info[i] ? `<span class="green">${info[i][0]}</span>  ${info[i][1]}` : '';
+        print(`<span class="ascii">${escapeHtml(logoPart)}</span>${infoPart}`);
+      }
+    },
+    reboot(){ out.innerHTML=''; runBoot(true); }
+  };
+
+  function stripQuotes(s){
+    s = s.trim();
+    if((s.startsWith('"')&&s.endsWith('"'))||(s.startsWith("'")&&s.endsWith("'"))) return s.slice(1,-1);
+    return s;
+  }
+  function renderTree(node, prefix){
+    if(!node) return;
+    const names = Object.keys(node.children);
+    names.forEach((name,i)=>{
+      const last = i===names.length-1;
+      const child = node.children[name];
+      print(`${prefix}${last?'└── ':'├── '}` + (child.type==='dir' ? `<span class="green">${name}/</span>` : name));
+      if(child.type==='dir') renderTree(child, prefix + (last?'    ':'│   '));
+    });
+  }
+  function countFiles(node){
+    let c = 0;
+    for(const k in node.children){
+      c += node.children[k].type==='file' ? 1 : countFiles(node.children[k]);
+    }
+    return c;
+  }
+  const bootTime = Date.now();
+  function uptimeStr(){
+    const s = Math.floor((Date.now()-bootTime)/1000);
+    return `${s}s`;
+  }
+
+  function navigate(pathArg){
+    if(!pathArg) return cwd.slice();
+    let base = pathArg.startsWith('/') ? [] : cwd.slice();
+    const parts = pathArg.split('/').filter(p=>p!=='' );
+    for(const p of parts){
+      if(p==='.') continue;
+      if(p==='..'){ if(base.length>0) base.pop(); continue; }
+      base.push(p);
+    }
+    return base;
+  }
+
+  function updatePrompt(){ promptPath.textContent = shortPath(cwd); }
+
+  /* ---------- input handling ---------- */
+  function handleCommand(raw){
+    const trimmed = raw.trim();
+    print(`<span class="prompt-echo"><span class="path">${escapeHtml(shortPath(cwd))}</span> &gt; ${escapeHtml(raw)}</span>`);
+    if(trimmed===''){ return; }
+    history.push(trimmed);
+    histIndex = history.length;
+
+    const [cmd, ...args] = trimmed.split(/\s+/);
+    const rest = trimmed.slice(cmd.length).trim();
+
+    if(commands[cmd]){
+      try{ commands[cmd](args, rest); }
+      catch(e){ print('error: ' + e.message, 'red'); }
+    } else {
+      print(`paish: command not found: ${cmd} — type 'help'`, 'red');
+    }
+  }
+
+  input.addEventListener('keydown', (e)=>{
+    if(!bootDone) return;
+    if(e.key==='Enter'){
+      const val = input.value;
+      input.value='';
+      handleCommand(val);
+    } else if(e.key==='ArrowUp'){
+      e.preventDefault();
+      if(history.length===0) return;
+      histIndex = Math.max(0, histIndex-1);
+      input.value = history[histIndex] || '';
+    } else if(e.key==='ArrowDown'){
+      e.preventDefault();
+      histIndex = Math.min(history.length, histIndex+1);
+      input.value = history[histIndex] || '';
+    } else if(e.key==='l' && e.ctrlKey){
+      e.preventDefault();
+      out.innerHTML='';
+    }
+  });
+  document.addEventListener('click', ()=> input.focus());
+
+  /* ---------- boot sequence ---------- */
+  function runBoot(fast){
+    bootDone = false;
+    input.blur();
+    const lines = [
+      ['PaiOS bootloader v1.0', 'dim'],
+      ['loading kernel modules ......... [ok]', 'dim'],
+      ['mounting virtual filesystem ..... [ok]', 'dim'],
+      ['starting paish shell ............ [ok]', 'dim'],
+      ['', null],
+      ["  ____        _  ___  ____ ", 'ascii bright'],
+      [" |  _ \\ __ _ (_)/ _ \\/ ___|", 'ascii bright'],
+      [" | |_) / _` || | | | \\___ \\", 'ascii bright'],
+      [" |  __/ (_| || | |_| |___) |", 'ascii bright'],
+      [" |_|   \\__,_|/ |\\___/|____/ ", 'ascii bright'],
+      ["           |__/             ", 'ascii bright'],
+      ['', null],
+      ["a tiny terminal operating system, entirely in your browser.", 'dim'],
+      ["type 'help' to see available commands.", 'dim'],
+      ['', null],
+    ];
+    let i = 0;
+    const delay = fast ? 40 : 90;
+    function step(){
+      if(i>=lines.length){
+        bootDone = true;
+        updatePrompt();
+        input.focus();
+        return;
+      }
+      const [text, cls] = lines[i];
+      print(escapeHtml(text) || '&nbsp;', cls);
+      i++;
+      setTimeout(step, delay + (Math.random()*40));
+    }
+    step();
+  }
+
+  runBoot(false);
+})();
+</script>
+</body>
+</html>
